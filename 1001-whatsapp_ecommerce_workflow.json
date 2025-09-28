@@ -1,0 +1,745 @@
+{
+  "id": "whatsapp-ecommerce-ai",
+  "meta": {
+    "instanceId": "your-instance-id-here"
+  },
+  "name": "WhatsApp E-commerce con IA y Base Vectorial",
+  "tags": ["ecommerce", "whatsapp", "ai", "milvus", "groq"],
+  "nodes": [
+    {
+      "id": "whatsapp-trigger",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [100, 200],
+      "parameters": {
+        "path": "whatsapp-webhook",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "extract-message",
+      "name": "Extraer Mensaje WhatsApp",
+      "type": "n8n-nodes-base.function",
+      "position": [300, 200],
+      "parameters": {
+        "functionCode": "// Extraer datos del webhook de WhatsApp\nconst body = $input.all()[0].json.body;\nconst message = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];\nconst contact = body.entry?.[0]?.changes?.[0]?.value?.contacts?.[0];\n\nif (!message) {\n  return [];\n}\n\nreturn [{\n  json: {\n    message_id: message.id,\n    phone_number: message.from,\n    customer_name: contact?.profile?.name || 'Cliente',\n    message_text: message.text?.body || '',\n    message_type: message.type,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "groq-llm",
+      "name": "Groq LLM - Análisis Intención",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "position": [500, 200],
+      "parameters": {
+        "text": "Analiza el siguiente mensaje de WhatsApp de un cliente e identifica:\n1. Si está buscando un producto específico\n2. Qué tipo de producto busca\n3. Palabras clave para búsqueda\n4. Si quiere hacer un pedido\n\nMensaje: {{ $json.message_text }}\n\nResponde en formato JSON:\n{\n  \"intent\": \"busqueda_producto|hacer_pedido|consulta_general\",\n  \"product_query\": \"palabras clave del producto\",\n  \"wants_to_buy\": true/false,\n  \"extracted_info\": \"información relevante\"\n}",
+        "promptType": "define"
+      },
+      "typeVersion": 1.5
+    },
+    {
+      "id": "groq-model",
+      "name": "Groq Llama Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "position": [600, 100],
+      "parameters": {
+        "model": "llama3-70b-8192",
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "credentials": {
+        "groqApi": {
+          "id": "your-groq-credentials",
+          "name": "Groq API"
+        }
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "parse-intent",
+      "name": "Procesar Respuesta IA",
+      "type": "n8n-nodes-base.function",
+      "position": [700, 200],
+      "parameters": {
+        "functionCode": "// Parsear respuesta JSON del LLM\nconst aiResponse = $json.text;\nlet parsedIntent;\n\ntry {\n  parsedIntent = JSON.parse(aiResponse);\n} catch (error) {\n  // Si no es JSON válido, crear estructura básica\n  parsedIntent = {\n    intent: \"consulta_general\",\n    product_query: $('extract-message').item(0).json.message_text,\n    wants_to_buy: false,\n    extracted_info: aiResponse\n  };\n}\n\nreturn [{\n  json: {\n    ...parsedIntent,\n    original_message: $('extract-message').item(0).json.message_text,\n    customer_name: $('extract-message').item(0).json.customer_name,\n    phone_number: $('extract-message').item(0).json.phone_number,\n    message_id: $('extract-message').item(0).json.message_id\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "milvus-search",
+      "name": "Búsqueda en Milvus",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "{{ $env.MILVUS_API_URL }}/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "collection_name",
+              "value": "products_collection"
+            },
+            {
+              "name": "query",
+              "value": "{{ $json.product_query }}"
+            },
+            {
+              "name": "limit",
+              "value": "5"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "milvus-credentials",
+          "name": "Milvus API"
+        }
+      },
+      "typeVersion": 4.1
+    },
+    {
+      "id": "format-product-response",
+      "name": "Formatear Respuesta Productos",
+      "type": "n8n-nodes-base.function",
+      "position": [1100, 200],
+      "parameters": {
+        "functionCode": "// Formatear productos encontrados para WhatsApp\nconst searchResults = $json;\nconst customerName = $('parse-intent').item(0).json.customer_name;\n\nlet response = `Hola ${customerName}! 👋\\n\\nEncontré estos productos para ti:\\n\\n`;\n\n// Simular estructura de productos (ajustar según tu base de datos)\nconst products = searchResults.results || [\n  {\n    id: \"PROD001\",\n    name: \"Smartphone Galaxy Pro\",\n    price: \"$599.99\",\n    description: \"Último modelo con cámara avanzada\",\n    image_url: \"https://example.com/phone.jpg\",\n    reviews: 4.5,\n    cross_sell: [\"Funda protectora\", \"Cargador inalámbrico\"]\n  }\n];\n\nproducts.forEach((product, index) => {\n  response += `🛍️ *${product.name}*\\n`;\n  response += `💰 Precio: ${product.price}\\n`;\n  response += `⭐ Calificación: ${product.reviews}/5\\n`;\n  response += `📝 ${product.description}\\n`;\n  \n  if (product.cross_sell && product.cross_sell.length > 0) {\n    response += `🔗 También te puede interesar: ${product.cross_sell.join(', ')}\\n`;\n  }\n  \n  response += `\\n`;\n});\n\nresponse += `¿Te interesa algún producto? ¡Escríbeme el nombre y te ayudo con tu pedido! 🛒`;\n\nreturn [{\n  json: {\n    whatsapp_response: response,\n    products_found: products,\n    customer_info: {\n      name: customerName,\n      phone: $('parse-intent').item(0).json.phone_number,\n      intent: $('parse-intent').item(0).json.intent\n    }\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "send-whatsapp-response",
+      "name": "Enviar Respuesta WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1300, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v18.0/{{ $env.WHATSAPP_PHONE_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messaging_product",
+              "value": "whatsapp"
+            },
+            {
+              "name": "to",
+              "value": "={{ $('parse-intent').item(0).json.phone_number }}"
+            },
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "text",
+              "value": "{\"body\": \"{{ $json.whatsapp_response }}\"}"
+            }
+          ]
+        }
+      },
+      "typeVersion": 4.1
+    },
+    {
+      "id": "create-airtable-record",
+      "name": "Crear Registro en Airtable",
+      "type": "n8n-nodes-base.airtable",
+      "position": [1300, 400],
+      "parameters": {
+        "operation": "create",
+        "application": "{{ $env.AIRTABLE_BASE_ID }}",
+        "table": "Pedidos",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Cliente",
+              "fieldValue": "={{ $('format-product-response').item(0).json.customer_info.name }}"
+            },
+            {
+              "fieldId": "Telefono",
+              "fieldValue": "={{ $('format-product-response').item(0).json.customer_info.phone }}"
+            },
+            {
+              "fieldId": "Mensaje_Original",
+              "fieldValue": "={{ $('parse-intent').item(0).json.original_message }}"
+            },
+            {
+              "fieldId": "Intencion",
+              "fieldValue": "={{ $('parse-intent').item(0).json.intent }}"
+            },
+            {
+              "fieldId": "Productos_Mostrados",
+              "fieldValue": "={{ $('format-product-response').item(0).json.products_found.map(p => p.name).join(', ') }}"
+            },
+            {
+              "fieldId": "Estado",
+              "fieldValue": "Consulta_Inicial"
+            },
+            {
+              "fieldId": "Fecha",
+              "fieldValue": "={{ new Date().toISOString() }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "airtable-credentials",
+          "name": "Airtable API"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "check-purchase-intent",
+      "name": "Verificar Intención de Compra",
+      "type": "n8n-nodes-base.if",
+      "position": [1500, 300],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "wants-to-buy",
+              "leftValue": "={{ $('parse-intent').item(0).json.wants_to_buy }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "generate-order",
+      "name": "Generar Orden de Compra",
+      "type": "n8n-nodes-base.function",
+      "position": [1700, 200],
+      "parameters": {
+        "functionCode": "// Generar orden de compra\nconst customer = $('format-product-response').item(0).json.customer_info;\nconst products = $('format-product-response').item(0).json.products_found;\n\n// Simular selección de producto (en realidad vendría de la conversación)\nconst selectedProduct = products[0];\n\nconst order = {\n  order_id: `ORD-${Date.now()}`,\n  customer_name: customer.name,\n  customer_phone: customer.phone,\n  product: selectedProduct,\n  quantity: 1,\n  total_amount: parseFloat(selectedProduct.price.replace('$', '').replace(',', '')),\n  status: 'pending_payment',\n  created_at: new Date().toISOString(),\n  payment_link: `https://tu-plataforma-pago.com/pay/${Date.now()}`\n};\n\nreturn [{\n  json: {\n    order: order,\n    customer: customer\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "send-payment-link",
+      "name": "Enviar Link de Pago",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1900, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v18.0/{{ $env.WHATSAPP_PHONE_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $env.WHATSAPP_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messaging_product",
+              "value": "whatsapp"
+            },
+            {
+              "name": "to",
+              "value": "={{ $json.customer.phone }}"
+            },
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "text",
+              "value": "{\"body\": \"🎉 ¡Perfecto! He preparado tu pedido:\\n\\n📦 Producto: {{ $json.order.product.name }}\\n💰 Total: ${{ $json.order.total_amount }}\\n\\n💳 Realiza tu pago aquí:\\n{{ $json.order.payment_link }}\\n\\nPedido #{{ $json.order.order_id }}\\n\\n¡Gracias por tu compra! 🛍️\"}"
+            }
+          ]
+        }
+      },
+      "typeVersion": 4.1
+    },
+    {
+      "id": "send-confirmation-email",
+      "name": "Enviar Email de Confirmación",
+      "type": "n8n-nodes-base.gmail",
+      "position": [1900, 400],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "{{ $json.customer.email || 'cliente@ejemplo.com' }}",
+        "subject": "Confirmación de Pedido #{{ $json.order.order_id }}",
+        "message": "Estimado/a {{ $json.customer.name }},\\n\\n¡Gracias por tu pedido!\\n\\nDetalles del pedido:\\n- Producto: {{ $json.order.product.name }}\\n- Cantidad: {{ $json.order.quantity }}\\n- Total: ${{ $json.order.total_amount }}\\n- Número de pedido: {{ $json.order.order_id }}\\n\\nPuedes realizar el pago en: {{ $json.order.payment_link }}\\n\\n¡Saludos!\\nEquipo de Ventas",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-credentials",
+          "name": "Gmail account"
+        }
+      },
+      "typeVersion": 2.1
+    },
+    {
+      "id": "update-airtable-order",
+      "name": "Actualizar Orden en Airtable",
+      "type": "n8n-nodes-base.airtable",
+      "position": [2100, 300],
+      "parameters": {
+        "operation": "update",
+        "application": "{{ $env.AIRTABLE_BASE_ID }}",
+        "table": "Pedidos",
+        "id": "={{ $('create-airtable-record').item(0).json.id }}",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Estado",
+              "fieldValue": "Orden_Generada"
+            },
+            {
+              "fieldId": "Order_ID",
+              "fieldValue": "={{ $('generate-order').item(0).json.order.order_id }}"
+            },
+            {
+              "fieldId": "Total",
+              "fieldValue": "={{ $('generate-order').item(0).json.order.total_amount }}"
+            },
+            {
+              "fieldId": "Link_Pago",
+              "fieldValue": "={{ $('generate-order').item(0).json.order.payment_link }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "airtable-credentials",
+          "name": "Airtable API"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "payment-webhook",
+      "name": "Webhook Confirmación Pago",
+      "type": "n8n-nodes-base.webhook",
+      "position": [100, 600],
+      "parameters": {
+        "path": "payment-confirmation",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "process-payment",
+      "name": "Procesar Confirmación Pago",
+      "type": "n8n-nodes-base.function",
+      "position": [300, 600],
+      "parameters": {
+        "functionCode": "// Procesar confirmación de pago\nconst paymentData = $json.body;\n\nreturn [{\n  json: {\n    order_id: paymentData.order_id,\n    payment_status: paymentData.status,\n    transaction_id: paymentData.transaction_id,\n    amount_paid: paymentData.amount,\n    payment_date: new Date().toISOString()\n  }\n}];"
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "update-paid-status",
+      "name": "Actualizar Estado a Facturado",
+      "type": "n8n-nodes-base.airtable",
+      "position": [500, 600],
+      "parameters": {
+        "operation": "list",
+        "application": "{{ $env.AIRTABLE_BASE_ID }}",
+        "table": "Pedidos",
+        "filterByFormula": "{Order_ID} = '{{ $json.order_id }}'",
+        "maxRecords": 1
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "airtable-credentials",
+          "name": "Airtable API"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "update-to-invoiced",
+      "name": "Marcar como Facturado",
+      "type": "n8n-nodes-base.airtable",
+      "position": [700, 600],
+      "parameters": {
+        "operation": "update",
+        "application": "{{ $env.AIRTABLE_BASE_ID }}",
+        "table": "Pedidos",
+        "id": "={{ $json.id }}",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Estado",
+              "fieldValue": "Facturado"
+            },
+            {
+              "fieldId": "Transaction_ID",
+              "fieldValue": "={{ $('process-payment').item(0).json.transaction_id }}"
+            },
+            {
+              "fieldId": "Fecha_Pago",
+              "fieldValue": "={{ $('process-payment').item(0).json.payment_date }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "airtable-credentials",
+          "name": "Airtable API"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "create-processing-order",
+      "name": "Crear Orden de Procesamiento",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 600],
+      "parameters": {
+        "method": "POST",
+        "url": "{{ $env.FULFILLMENT_API_URL }}/create-order",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $env.FULFILLMENT_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "order_id",
+              "value": "={{ $('process-payment').item(0).json.order_id }}"
+            },
+            {
+              "name": "customer_info",
+              "value": "={{ $json }}"
+            },
+            {
+              "name": "status",
+              "value": "ready_for_processing"
+            }
+          ]
+        }
+      },
+      "typeVersion": 4.1
+    },
+    {
+      "id": "final-update-airtable",
+      "name": "Estado Final: Procesando",
+      "type": "n8n-nodes-base.airtable",
+      "position": [1100, 600],
+      "parameters": {
+        "operation": "update",
+        "application": "{{ $env.AIRTABLE_BASE_ID }}",
+        "table": "Pedidos",
+        "id": "={{ $('update-paid-status').item(0).json.id }}",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "Estado",
+              "fieldValue": "Procesando"
+            },
+            {
+              "fieldId": "Fulfillment_ID",
+              "fieldValue": "={{ $json.fulfillment_id }}"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "airtable-credentials",
+          "name": "Airtable API"
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "webhook-response",
+      "name": "Respuesta Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1500, 200],
+      "parameters": {
+        "options": {}
+      },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "whatsapp-trigger": {
+      "main": [
+        [
+          {
+            "node": "extract-message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "extract-message": {
+      "main": [
+        [
+          {
+            "node": "groq-llm",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "groq-llm": {
+      "main": [
+        [
+          {
+            "node": "parse-intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "groq-model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "groq-llm",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse-intent": {
+      "main": [
+        [
+          {
+            "node": "milvus-search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "milvus-search": {
+      "main": [
+        [
+          {
+            "node": "format-product-response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "format-product-response": {
+      "main": [
+        [
+          {
+            "node": "send-whatsapp-response",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "create-airtable-record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send-whatsapp-response": {
+      "main": [
+        [
+          {
+            "node": "webhook-response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create-airtable-record": {
+      "main": [
+        [
+          {
+            "node": "check-purchase-intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check-purchase-intent": {
+      "main": [
+        [
+          {
+            "node": "generate-order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "generate-order": {
+      "main": [
+        [
+          {
+            "node": "send-payment-link",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "send-confirmation-email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send-payment-link": {
+      "main": [
+        [
+          {
+            "node": "update-airtable-order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "send-confirmation-email": {
+      "main": [
+        [
+          {
+            "node": "update-airtable-order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "payment-webhook": {
+      "main": [
+        [
+          {
+            "node": "process-payment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "process-payment": {
+      "main": [
+        [
+          {
+            "node": "update-paid-status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update-paid-status": {
+      "main": [
+        [
+          {
+            "node": "update-to-invoiced",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "update-to-invoiced": {
+      "main": [
+        [
+          {
+            "node": "create-processing-order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "create-processing-order": {
+      "main": [
+        [
+          {
+            "node": "final-update-airtable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "whatsapp-ecommerce-v1"
+}
